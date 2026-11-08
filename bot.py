@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -78,25 +79,21 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-
-        # --- required_channels: اگر ساختار قدیمی بود، بازسازی کن ---
         cur.execute("""
             SELECT column_name FROM information_schema.columns
             WHERE table_name = 'required_channels';
         """)
         cols = [r[0] for r in cur.fetchall()]
         if cols and "channel_username" not in cols:
-            logger.warning(f"⚠️ required_channels ساختار قدیمی دارد ({cols}). در حال بازسازی...")
+            logger.warning(f"⚠️ required_channels ساختار قدیمی ({cols}). بازسازی...")
             cur.execute("DROP TABLE required_channels CASCADE;")
             cols = []
-
         if not cols:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS required_channels (
                     channel_username TEXT PRIMARY KEY
                 );
             """)
-
         for ch in REQUIRED_CHANNELS:
             cur.execute(
                 "INSERT INTO required_channels(channel_username) VALUES (%s) "
@@ -146,26 +143,29 @@ def add_balance(uid, amount):
 def grant_referral_reward_if_eligible(referrer_id, referred_id):
     if not referrer_id or referrer_id == referred_id:
         return
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT is_verified, is_joined_channels FROM users WHERE user_id=%s",
-            (referred_id,),
-        )
-        r = cur.fetchone()
-        if not r or not r[0] or not r[1]:
-            return
-        cur.execute("SELECT 1 FROM referral_logs WHERE referred_id=%s", (referred_id,))
-        if cur.fetchone():
-            return
-        cur.execute(
-            "INSERT INTO referral_logs(referrer_id, referred_id, reward_amount) VALUES (%s,%s,%s)",
-            (referrer_id, referred_id, REFERRAL_REWARD),
-        )
-        cur.execute(
-            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-            (REFERRAL_REWARD, referrer_id),
-        )
-    logger.info(f"🎁 referral reward {REFERRAL_REWARD} TRX: {referrer_id} <- {referred_id}")
+    try:
+        with db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT is_verified, is_joined_channels FROM users WHERE user_id=%s",
+                (referred_id,),
+            )
+            r = cur.fetchone()
+            if not r or not r[0] or not r[1]:
+                return
+            cur.execute("SELECT 1 FROM referral_logs WHERE referred_id=%s", (referred_id,))
+            if cur.fetchone():
+                return
+            cur.execute(
+                "INSERT INTO referral_logs(referrer_id, referred_id, reward_amount) VALUES (%s,%s,%s)",
+                (referrer_id, referred_id, REFERRAL_REWARD),
+            )
+            cur.execute(
+                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+                (REFERRAL_REWARD, referrer_id),
+            )
+        logger.info(f"🎁 referral reward {REFERRAL_REWARD} TRX: {referrer_id} <- {referred_id}")
+    except Exception as e:
+        logger.error(f"referral reward failed: {e}", exc_info=True)
 
 # ---------- helpers ----------
 def normalize_iran_phone(p: str):
@@ -212,12 +212,12 @@ def phone_kb():
 async def ask_phone(msg):
     await msg.reply_text(
         "📱 برای ادامه، شماره موبایل ایران خود را ارسال کنید.\n"
-        "می‌توانید از دکمه زیر استفاده کنید یا دستی بنویسید:\n"
-        "فرمت‌ها: 09xxxxxxxxx | +989xxxxxxxxx | 00989xxxxxxxxx",
+        "از دکمه زیر یا نوشتن دستی استفاده کنید:\n"
+        "09xxxxxxxxx | +989xxxxxxxxx | 00989xxxxxxxxx",
         reply_markup=phone_kb(),
     )
 
-async def ask_join(update_or_msg):
+async def ask_join(msg):
     text = (
         "⚠️ برای استفاده از ربات باید در کانال‌های زیر عضو شوید:\n\n"
         "1️⃣ @BET_1XZX\n2️⃣ @GAP_BAZIN1\n\n"
@@ -230,52 +230,69 @@ async def ask_join(update_or_msg):
             [InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_membership")],
         ]
     )
-    if isinstance(update_or_msg, Update):
-        await update_or_msg.message.reply_text(text, reply_markup=kb)
-    else:
-        await update_or_msg.reply_text(text, reply_markup=kb)
+    await msg.reply_text(text, reply_markup=kb)
+
+# ---------- debug ----------
+async def debug_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        ut = "?"
+        if update.message:
+            ut = "message"
+        elif update.callback_query:
+            ut = "callback"
+        elif update.edited_message:
+            ut = "edited"
+        logger.info(f"🔔 UPDATE id={update.update_id} type={ut} from={update.effective_user.id if update.effective_user else '?'} text={update.effective_message.text if update.effective_message and update.effective_message.text else ''}")
+    except Exception as e:
+        logger.warning(f"debug_update err: {e}")
 
 # ---------- handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    logger.info(f"📥 /start from {u.id} @{u.username}")
-    referrer_id = None
-    if context.args:
-        a = context.args[0]
-        if a.startswith("ref_"):
-            try:
-                referrer_id = int(a[4:])
-            except ValueError:
-                referrer_id = None
-            if referrer_id == u.id:
-                referrer_id = None
+    logger.info(f"📥 ENTER start handler for {u.id}")
+    try:
+        referrer_id = None
+        if context.args:
+            a = context.args[0]
+            if a.startswith("ref_"):
+                try:
+                    referrer_id = int(a[4:])
+                except ValueError:
+                    referrer_id = None
+                if referrer_id == u.id:
+                    referrer_id = None
 
-    create_user_if_needed(u.id, u.username, referrer_id)
-    row = get_user(u.id)
-    is_verified = row[5]
-    is_joined = row[6]
-    ref_id = row[3]
+        create_user_if_needed(u.id, u.username, referrer_id)
+        row = get_user(u.id)
+        logger.info(f"user row: verified={row[5]} joined={row[6]}")
 
-    if not is_verified:
-        await ask_phone(update.message)
-        return WAITING_PHONE
+        if not row[5]:
+            await ask_phone(update.message)
+            return WAITING_PHONE
 
-    if not is_joined:
-        ok = await check_members(context.bot, u.id)
-        if ok:
-            set_joined(u.id)
-            grant_referral_reward_if_eligible(ref_id, u.id)
-            await update.message.reply_text(
-                "✅ خوش آمدید!", reply_markup=main_menu_kb()
-            )
+        if not row[6]:
+            ok = await check_members(context.bot, u.id)
+            if ok:
+                set_joined(u.id)
+                grant_referral_reward_if_eligible(row[3], u.id)
+                await update.message.reply_text(
+                    "✅ خوش آمدید!", reply_markup=main_menu_kb()
+                )
+                return ConversationHandler.END
+            await ask_join(update.message)
             return ConversationHandler.END
-        await ask_join(update)
-        return ConversationHandler.END
 
-    await update.message.reply_text(
-        "✅ به منوی اصلی خوش آمدید:", reply_markup=main_menu_kb()
-    )
-    return ConversationHandler.END
+        await update.message.reply_text(
+            "✅ به منوی اصلی خوش آمدید:", reply_markup=main_menu_kb()
+        )
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"start handler crashed: {e}", exc_info=True)
+        try:
+            await update.message.reply_text("❌ خطای داخلی. دوباره تلاش کن.")
+        except Exception:
+            pass
+        return ConversationHandler.END
 
 async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -306,12 +323,12 @@ async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_joined(u.id)
         grant_referral_reward_if_eligible(ref_id, u.id)
         await update.message.reply_text(
-            "✅ شماره تایید شد و عضویت شما تایید شد.",
+            "✅ شماره و عضویت تایید شد.",
             reply_markup=main_menu_kb(),
         )
     else:
         await update.message.reply_text("✅ شماره تایید شد.")
-        await ask_join(update)
+        await ask_join(update.message)
     return ConversationHandler.END
 
 async def check_membership_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -572,25 +589,17 @@ async def withdraw_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"notify user: {e}")
 
 # ---------- setup ----------
-async def post_init(app: Application):
-    logger.info("🔍 init DB...")
-    init_db()
-    me = await app.bot.get_me()
-    logger.info(f"✅ Bot: @{me.username} (id={me.id})")
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ webhook cleared")
-    except Exception as e:
-        logger.warning(f"delete_webhook: {e}")
-
 async def on_error(update, context):
-    logger.error(f"handler error: {context.error}", exc_info=context.error)
+    logger.error(f"handler error: {context.error!r}", exc_info=context.error)
 
 def main():
+    logger.info("🔍 init DB before polling...")
+    init_db()
+
+    logger.info("🚀 building app...")
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
         .concurrent_updates(False)
         .build()
     )
@@ -617,6 +626,9 @@ def main():
         menu_button,
     )
 
+    # دیباگر اول از همه، در گروه -1
+    app.add_handler(MessageHandler(filters.ALL, debug_update), group=-1)
+
     app.add_handler(conv)
     app.add_handler(menu)
     app.add_handler(CommandHandler("admin", admin))
@@ -626,8 +638,33 @@ def main():
     app.add_handler(CallbackQueryHandler(withdraw_cb, pattern=r"^(approve|reject)_\d+$"))
     app.add_error_handler(on_error)
 
-    logger.info("✅ handlers registered, starting polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # چک get_me
+    async def _run():
+        me = await app.bot.get_me()
+        logger.info(f"✅ Bot: @{me.username} (id={me.id})")
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ webhook cleared")
+        except Exception as e:
+            logger.warning(f"delete_webhook: {e}")
+        logger.info("✅ starting polling...")
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=False,
+        )
+        # نگه‌داشتن پروسه
+        stop = asyncio.Event()
+        await stop.wait()
+
+    try:
+        asyncio.run(_run())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("stopped by user")
+    except Exception as e:
+        logger.critical(f"FATAL: {e}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
     main()

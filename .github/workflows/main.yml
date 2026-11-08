@@ -1,40 +1,55 @@
-name: Telegram Bot
+name: Run Telegram Bot (Manual)
 
 on:
   workflow_dispatch:
+    inputs:
+      reason:
+        description: 'دلیل اجرا (اختیاری)'
+        required: false
+        default: 'manual run'
 
 jobs:
   run-bot:
+    name: Start Bot Polling
     runs-on: ubuntu-latest
+    timeout-minutes: 350
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Show trigger info
+        run: |
+          echo "▶️ اجرا توسط: ${{ github.actor }}"
+          echo "📝 دلیل: ${{ github.event.inputs.reason }}"
+          echo "🕒 زمان (UTC): $(date -u)"
+
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          pip install -r requirements.txt
 
-      - name: Check secrets
+      - name: Verify secrets exist
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           OWNER_ID: ${{ secrets.OWNER_ID }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          test -n "$BOT_TOKEN" || (echo "BOT_TOKEN is missing" && exit 1)
-          test -n "$OWNER_ID" || (echo "OWNER_ID is missing" && exit 1)
-          test -n "$DATABASE_URL" || (echo "DATABASE_URL is missing" && exit 1)
-          echo "All required secrets are set."
+          if [ -z "$BOT_TOKEN" ]; then echo "❌ BOT_TOKEN تنظیم نشده"; exit 1; fi
+          if [ -z "$OWNER_ID" ]; then echo "❌ OWNER_ID تنظیم نشده"; exit 1; fi
+          if [ -z "$DATABASE_URL" ]; then echo "❌ DATABASE_URL تنظیم نشده"; exit 1; fi
+          echo "✅ همه Secrets موجود هستند."
 
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           OWNER_ID: ${{ secrets.OWNER_ID }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PYTHONUNBUFFERED: "1"
         run: python bot.py

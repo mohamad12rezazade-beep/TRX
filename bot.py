@@ -14,7 +14,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, filters, ContextTypes,
 )
-from telegram.error import Forbidden, RetryAfter, BadRequest
+from telegram.error import Forbidden, RetryAfter
 
 # ---------- ENV ----------
 def _clean_token(t: str) -> str:
@@ -31,7 +31,7 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 if not BOT_TOKEN or not OWNER_ID_RAW.isdigit() or not DATABASE_URL:
-    logger.critical("❌ خطا در ENV ها")
+    logger.critical("❌ خطا در ENV ها (BOT_TOKEN, OWNER_ID, DATABASE_URL)")
     sys.exit(1)
 
 OWNER_ID = int(OWNER_ID_RAW)
@@ -61,27 +61,22 @@ def _table_has_expected_columns(cur, table, expected):
 
 def init_db():
     with db() as conn, conn.cursor() as cur:
-        # users
         if not _table_has_expected_columns(cur, "users", ["user_id", "username", "phone_number", "referrer_id", "balance", "is_verified", "is_joined_channels", "created_at"]):
             cur.execute("DROP TABLE IF EXISTS users CASCADE;")
             cur.execute("CREATE TABLE users (user_id BIGINT PRIMARY KEY, username TEXT, phone_number TEXT, referrer_id BIGINT, balance DOUBLE PRECISION DEFAULT 0.0, is_verified BOOLEAN DEFAULT FALSE, is_joined_channels BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);")
         
-        # withdrawals
         if not _table_has_expected_columns(cur, "withdrawals", ["id", "user_id", "amount", "wallet_address", "status", "created_at", "updated_at"]):
             cur.execute("DROP TABLE IF EXISTS withdrawals CASCADE;")
             cur.execute("CREATE TABLE withdrawals (id SERIAL PRIMARY KEY, user_id BIGINT, amount DOUBLE PRECISION NOT NULL, wallet_address TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);")
         
-        # referral_logs
         if not _table_has_expected_columns(cur, "referral_logs", ["id", "referrer_id", "referred_id", "reward_amount", "created_at"]):
             cur.execute("DROP TABLE IF EXISTS referral_logs CASCADE;")
             cur.execute("CREATE TABLE referral_logs (id SERIAL PRIMARY KEY, referrer_id BIGINT, referred_id BIGINT UNIQUE, reward_amount DOUBLE PRECISION, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);")
         
-        # required_channels
         if not _table_has_expected_columns(cur, "required_channels", ["channel_username"]):
             cur.execute("DROP TABLE IF EXISTS required_channels CASCADE;")
             cur.execute("CREATE TABLE required_channels (channel_username TEXT PRIMARY KEY);")
         
-        # settings (برای ذخیره کانال گزارش)
         if not _table_has_expected_columns(cur, "settings", ["key", "value"]):
             cur.execute("DROP TABLE IF EXISTS settings CASCADE;")
             cur.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);")
@@ -335,7 +330,7 @@ async def cancel_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ---------- USER MENU ----------
-async def user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def user_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     u = update.effective_user
     
@@ -423,7 +418,6 @@ async def admin_set_channel_save(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ آیدی باید با @ شروع شود. دوباره وارد کنید یا /cancel بزنید.")
         return WAITING_CHANNEL_ID
     
-    # بررسی اینکه ربات در کانال ادمین هست و می‌تونه پیام بفرسته
     try:
         chat = await context.bot.get_chat(chat_id=ch)
         bot_member = await context.bot.get_chat_member(chat_id=ch, user_id=context.bot.id)
@@ -506,11 +500,9 @@ async def withdraw_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "approve":
             cur.execute("UPDATE withdrawals SET status='approved', updated_at=NOW() WHERE id=%s", (wid,))
             await q.edit_message_text(f"✅ #{wid} تایید شد.")
-            # 1. اطلاع به کاربر
             try: await context.bot.send_message(uid, f"✅ برداشت {amt:.4f} TRX تایید شد.")
             except: pass
             
-            # 2. ارسال به کانال گزارش
             report_ch = get_setting("report_channel", "@BET_1XZX")
             channel_msg = f"✅ برداشت تایید شد\nUser: `{uid}`\nAmount: {amt:.4f} TRX"
             try:
@@ -576,9 +568,11 @@ def main():
         allow_reentry=True,
     )
 
-    user_menu = MessageHandler(filters.Regex(r"^(💰 موجودی|👥 رفرال‌گیری|📋 برداشت‌های تایید شده)$"), user_menu)
+    # هندلرهای منوی کاربر
+    user_menu_h = MessageHandler(filters.Regex(r"^(💰 موجودی|👥 رفرال‌گیری|📋 برداشت‌های تایید شده)$"), user_menu_handler)
     
-    admin_menu = MessageHandler(
+    # هندلرهای منوی ادمین
+    admin_menu_h = MessageHandler(
         filters.Regex(r"^(📊 آمار کل|👥 لیست کاربران|⏳ برداشت‌های Pending|⬅️ بازگشت به منوی اصلی)$"),
         lambda u, c: (
             admin_stats(u, c) if u.message.text == "📊 آمار کل" else
@@ -594,8 +588,8 @@ def main():
     app.add_handler(withdraw_conv)
     app.add_handler(user_conv)
     app.add_handler(CommandHandler("admin", admin))
-    app.add_handler(admin_menu)
-    app.add_handler(user_menu)
+    app.add_handler(admin_menu_h)
+    app.add_handler(user_menu_h)
     app.add_handler(CallbackQueryHandler(check_membership_cb, pattern=r"^check_membership$"))
     app.add_handler(CallbackQueryHandler(withdraw_cb, pattern=r"^(approve|reject)_\d+$"))
     app.add_error_handler(on_error)

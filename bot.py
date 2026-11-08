@@ -1,8 +1,8 @@
-import asyncio
 import logging
 import os
 import re
 import sys
+import asyncio
 
 import psycopg
 from telegram import (
@@ -16,9 +16,17 @@ from telegram.ext import (
 )
 
 # ---------- ENV ----------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OWNER_ID = os.environ.get("OWNER_ID")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+def _clean_token(t: str) -> str:
+    if not t:
+        return ""
+    t = t.strip().replace("\n", "").replace("\r", "").replace("\t", "").replace(" ", "")
+    if t.lower().startswith("bot"):
+        t = t[3:]
+    return t
+
+BOT_TOKEN = _clean_token(os.environ.get("BOT_TOKEN", ""))
+OWNER_ID_RAW = (os.environ.get("OWNER_ID", "") or "").strip()
+DATABASE_URL = (os.environ.get("DATABASE_URL", "") or "").strip()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -26,17 +34,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-if not BOT_TOKEN or not OWNER_ID or not DATABASE_URL:
-    logger.error("❌ ENV ناقص است (BOT_TOKEN/OWNER_ID/DATABASE_URL)")
+if not BOT_TOKEN:
+    logger.critical("❌ BOT_TOKEN خالی")
     sys.exit(1)
-try:
-    OWNER_ID = int(OWNER_ID)
-except ValueError:
-    logger.error("❌ OWNER_ID باید عدد باشد")
+if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", BOT_TOKEN):
+    logger.critical(f"❌ BOT_TOKEN shape invalid: len={len(BOT_TOKEN)}")
     sys.exit(1)
+if not OWNER_ID_RAW.isdigit():
+    logger.critical(f"❌ OWNER_ID باید عدد باشد: {OWNER_ID_RAW!r}")
+    sys.exit(1)
+if not DATABASE_URL:
+    logger.critical("❌ DATABASE_URL خالی")
+    sys.exit(1)
+
+OWNER_ID = int(OWNER_ID_RAW)
 
 WAITING_PHONE, WAITING_WITHDRAW_AMOUNT, WAITING_WITHDRAW_ADDRESS = range(3)
-
 REQUIRED_CHANNELS = ["@BET_1XZX", "@GAP_BAZIN1"]
 MIN_WITHDRAW = 2.0
 REFERRAL_REWARD = 0.2
@@ -45,52 +58,79 @@ REFERRAL_REWARD = 0.2
 def db():
     return psycopg.connect(DATABASE_URL, autocommit=True)
 
+def _table_has_expected_columns(cur, table, expected):
+    """چک کردن اینکه جدول وجود دارد و همه ستون‌های انتظاری را دارد."""
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns WHERE table_name = %s
+    """, (table,))
+    cols = {r[0] for r in cur.fetchall()}
+    if not cols:
+        return False
+    missing = [c for c in expected if c not in cols]
+    if missing:
+        logger.warning(f"⚠️ جدول {table} ستون‌های {missing} را ندارد → بازسازی")
+        return False
+    return True
+
 def init_db():
+    """ساخت یا بازسازی جداول با ساختار قطعی."""
     with db() as conn, conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                phone_number TEXT,
-                referrer_id BIGINT,
-                balance DOUBLE PRECISION DEFAULT 0.0,
-                is_verified BOOLEAN DEFAULT FALSE,
-                is_joined_channels BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS withdrawals (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                amount DOUBLE PRECISION NOT NULL,
-                wallet_address TEXT NOT NULL,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS referral_logs (
-                id SERIAL PRIMARY KEY,
-                referrer_id BIGINT,
-                referred_id BIGINT UNIQUE,
-                reward_amount DOUBLE PRECISION,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        cur.execute("""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_name = 'required_channels';
-        """)
-        cols = [r[0] for r in cur.fetchall()]
-        if cols and "channel_username" not in cols:
-            logger.warning(f"⚠️ required_channels ساختار قدیمی ({cols}). بازسازی...")
-            cur.execute("DROP TABLE required_channels CASCADE;")
-            cols = []
-        if not cols:
+        # users
+        if not _table_has_expected_columns(cur, "users", [
+            "user_id", "username", "phone_number", "referrer_id",
+            "balance", "is_verified", "is_joined_channels", "created_at"
+        ]):
+            cur.execute("DROP TABLE IF EXISTS users CASCADE;")
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS required_channels (
+                CREATE TABLE users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    phone_number TEXT,
+                    referrer_id BIGINT,
+                    balance DOUBLE PRECISION DEFAULT 0.0,
+                    is_verified BOOLEAN DEFAULT FALSE,
+                    is_joined_channels BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+        # withdrawals
+        if not _table_has_expected_columns(cur, "withdrawals", [
+            "id", "user_id", "amount", "wallet_address", "status", "created_at", "updated_at"
+        ]):
+            cur.execute("DROP TABLE IF EXISTS withdrawals CASCADE;")
+            cur.execute("""
+                CREATE TABLE withdrawals (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    amount DOUBLE PRECISION NOT NULL,
+                    wallet_address TEXT NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+        # referral_logs
+        if not _table_has_expected_columns(cur, "referral_logs", [
+            "id", "referrer_id", "referred_id", "reward_amount", "created_at"
+        ]):
+            cur.execute("DROP TABLE IF EXISTS referral_logs CASCADE;")
+            cur.execute("""
+                CREATE TABLE referral_logs (
+                    id SERIAL PRIMARY KEY,
+                    referrer_id BIGINT,
+                    referred_id BIGINT UNIQUE,
+                    reward_amount DOUBLE PRECISION,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+        # required_channels
+        if not _table_has_expected_columns(cur, "required_channels", ["channel_username"]):
+            cur.execute("DROP TABLE IF EXISTS required_channels CASCADE;")
+            cur.execute("""
+                CREATE TABLE required_channels (
                     channel_username TEXT PRIMARY KEY
                 );
             """)
@@ -104,7 +144,11 @@ def init_db():
 
 def get_user(uid):
     with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT * FROM users WHERE user_id=%s", (uid,))
+        cur.execute("""
+            SELECT user_id, username, phone_number, referrer_id,
+                   balance, is_verified, is_joined_channels, created_at
+            FROM users WHERE user_id=%s
+        """, (uid,))
         return cur.fetchone()
 
 def create_user_if_needed(uid, username=None, referrer_id=None):
@@ -121,10 +165,7 @@ def create_user_if_needed(uid, username=None, referrer_id=None):
 
 def set_verified(uid, phone):
     with db() as conn, conn.cursor() as cur:
-        cur.execute(
-            "UPDATE users SET phone_number=%s, is_verified=TRUE WHERE user_id=%s",
-            (phone, uid),
-        )
+        cur.execute("UPDATE users SET phone_number=%s, is_verified=TRUE WHERE user_id=%s", (phone, uid))
 
 def set_joined(uid):
     with db() as conn, conn.cursor() as cur:
@@ -145,10 +186,7 @@ def grant_referral_reward_if_eligible(referrer_id, referred_id):
         return
     try:
         with db() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT is_verified, is_joined_channels FROM users WHERE user_id=%s",
-                (referred_id,),
-            )
+            cur.execute("SELECT is_verified, is_joined_channels FROM users WHERE user_id=%s", (referred_id,))
             r = cur.fetchone()
             if not r or not r[0] or not r[1]:
                 return
@@ -159,11 +197,8 @@ def grant_referral_reward_if_eligible(referrer_id, referred_id):
                 "INSERT INTO referral_logs(referrer_id, referred_id, reward_amount) VALUES (%s,%s,%s)",
                 (referrer_id, referred_id, REFERRAL_REWARD),
             )
-            cur.execute(
-                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                (REFERRAL_REWARD, referrer_id),
-            )
-        logger.info(f"🎁 referral reward {REFERRAL_REWARD} TRX: {referrer_id} <- {referred_id}")
+            cur.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (REFERRAL_REWARD, referrer_id))
+        logger.info(f"🎁 referral reward to {referrer_id} for {referred_id}")
     except Exception as e:
         logger.error(f"referral reward failed: {e}", exc_info=True)
 
@@ -211,45 +246,44 @@ def phone_kb():
 
 async def ask_phone(msg):
     await msg.reply_text(
-        "📱 برای ادامه، شماره موبایل ایران خود را ارسال کنید.\n"
-        "از دکمه زیر یا نوشتن دستی استفاده کنید:\n"
-        "09xxxxxxxxx | +989xxxxxxxxx | 00989xxxxxxxxx",
+        "📱 شماره موبایل ایران را ارسال کنید:\n"
+        "09xxxxxxxxx | +989xxxxxxxxx | 00989xxxxxxxxx\n\n"
+        "می‌توانید از دکمه زیر استفاده کنید:",
         reply_markup=phone_kb(),
     )
 
 async def ask_join(msg):
-    text = (
-        "⚠️ برای استفاده از ربات باید در کانال‌های زیر عضو شوید:\n\n"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 کانال ۱", url="https://t.me/BET_1XZX")],
+        [InlineKeyboardButton("📢 کانال ۲", url="https://t.me/GAP_BAZIN1")],
+        [InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_membership")],
+    ])
+    await msg.reply_text(
+        "⚠️ برای استفاده، در این کانال‌ها عضو شوید:\n\n"
         "1️⃣ @BET_1XZX\n2️⃣ @GAP_BAZIN1\n\n"
-        "بعد از عضویت، دکمه «✅ بررسی عضویت» را بزنید."
+        "سپس «بررسی عضویت» را بزنید.",
+        reply_markup=kb,
     )
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📢 کانال ۱", url="https://t.me/BET_1XZX")],
-            [InlineKeyboardButton("📢 کانال ۲", url="https://t.me/GAP_BAZIN1")],
-            [InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_membership")],
-        ]
-    )
-    await msg.reply_text(text, reply_markup=kb)
 
 # ---------- debug ----------
 async def debug_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        ut = "?"
-        if update.message:
-            ut = "message"
-        elif update.callback_query:
-            ut = "callback"
-        elif update.edited_message:
-            ut = "edited"
-        logger.info(f"🔔 UPDATE id={update.update_id} type={ut} from={update.effective_user.id if update.effective_user else '?'} text={update.effective_message.text if update.effective_message and update.effective_message.text else ''}")
+        typ = (
+            "callback" if update.callback_query else
+            "message" if update.message else
+            "edited" if update.edited_message else
+            "other"
+        )
+        uid = update.effective_user.id if update.effective_user else "?"
+        txt = update.effective_message.text if update.effective_message and update.effective_message.text else ""
+        logger.info(f"🔔 UPDATE id={update.update_id} type={typ} from={uid} text={txt!r}")
     except Exception as e:
         logger.warning(f"debug_update err: {e}")
 
 # ---------- handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    logger.info(f"📥 ENTER start handler for {u.id}")
+    logger.info(f"📥 ENTER start for {u.id}")
     try:
         referrer_id = None
         if context.args:
@@ -264,17 +298,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         create_user_if_needed(u.id, u.username, referrer_id)
         row = get_user(u.id)
-        logger.info(f"user row: verified={row[5]} joined={row[6]}")
 
-        if not row[5]:
+        if not row:
+            logger.error(f"user {u.id} row missing right after insert")
+            await update.message.reply_text("❌ خطای دیتابیس. دوباره تلاش کن.")
+            return ConversationHandler.END
+
+        # row = (user_id, username, phone_number, referrer_id, balance, is_verified, is_joined_channels, created_at)
+        is_verified = bool(row[5])
+        is_joined = bool(row[6])
+        ref_id = row[3]
+
+        if not is_verified:
             await ask_phone(update.message)
             return WAITING_PHONE
 
-        if not row[6]:
-            ok = await check_members(context.bot, u.id)
-            if ok:
+        if not is_joined:
+            if await check_members(context.bot, u.id):
                 set_joined(u.id)
-                grant_referral_reward_if_eligible(row[3], u.id)
+                grant_referral_reward_if_eligible(ref_id, u.id)
                 await update.message.reply_text(
                     "✅ خوش آمدید!", reply_markup=main_menu_kb()
                 )
@@ -287,7 +329,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
     except Exception as e:
-        logger.error(f"start handler crashed: {e}", exc_info=True)
+        logger.error(f"start crashed: {e}", exc_info=True)
         try:
             await update.message.reply_text("❌ خطای داخلی. دوباره تلاش کن.")
         except Exception:
@@ -296,15 +338,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    phone = None
-    if update.message.contact:
-        phone = update.message.contact.phone_number
-    elif update.message.text:
-        phone = update.message.text
-    if not phone:
-        await ask_phone(update.message)
-        return WAITING_PHONE
-
+    phone = update.message.contact.phone_number if update.message.contact else (update.message.text or "")
     norm = normalize_iran_phone(phone)
     if not norm:
         await update.message.reply_text(
@@ -315,16 +349,14 @@ async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     set_verified(u.id, norm)
     logger.info(f"✅ phone verified {u.id} -> {norm}")
-
     row = get_user(u.id)
     ref_id = row[3] if row else None
-    ok = await check_members(context.bot, u.id)
-    if ok:
+
+    if await check_members(context.bot, u.id):
         set_joined(u.id)
         grant_referral_reward_if_eligible(ref_id, u.id)
         await update.message.reply_text(
-            "✅ شماره و عضویت تایید شد.",
-            reply_markup=main_menu_kb(),
+            "✅ شماره و عضویت تایید شد.", reply_markup=main_menu_kb()
         )
     else:
         await update.message.reply_text("✅ شماره تایید شد.")
@@ -335,8 +367,7 @@ async def check_membership_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    ok = await check_members(context.bot, uid)
-    if not ok:
+    if not await check_members(context.bot, uid):
         await q.answer("❌ هنوز عضو کانال‌ها نیستی.", show_alert=True)
         return
     set_joined(uid)
@@ -347,9 +378,7 @@ async def check_membership_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
     await context.bot.send_message(
-        chat_id=uid,
-        text="به منوی اصلی خوش آمدید:",
-        reply_markup=main_menu_kb(),
+        chat_id=uid, text="به منوی اصلی خوش آمدید:", reply_markup=main_menu_kb()
     )
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -372,10 +401,10 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             cnt, total = cur.fetchone()
         await update.message.reply_text(
-            f"👥 لینک رفرال شما:\n{link}\n\n"
+            f"👥 لینک رفرال:\n{link}\n\n"
             f"تعداد دعوت موفق: {cnt}\n"
             f"مجموع پاداش: {total:.2f} TRX\n"
-            f"پاداش هر دعوت: {REFERRAL_REWARD} TRX",
+            f"پاداش هر دعوت: {REFERRAL_REWARD} TRX"
         )
 
     elif text == "💸 برداشت":
@@ -386,7 +415,7 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await update.message.reply_text(
-            f"موجودی: {bal:.4f} TRX\nمبلغ برداشت را وارد کن (حداقل {MIN_WITHDRAW}):"
+            f"موجودی: {bal:.4f} TRX\nمبلغ برداشت (حداقل {MIN_WITHDRAW}):"
         )
         return WAITING_WITHDRAW_AMOUNT
 
@@ -421,7 +450,7 @@ async def withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ موجودی کافی نیست.")
         return WAITING_WITHDRAW_AMOUNT
     context.user_data["w_amount"] = amt
-    await update.message.reply_text("آدرس کیف پول TRON را وارد کن (شروع با T، 34 کاراکتر):")
+    await update.message.reply_text("آدرس TRON (شروع با T، 34 کاراکتر):")
     return WAITING_WITHDRAW_ADDRESS
 
 async def withdraw_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,10 +458,10 @@ async def withdraw_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = update.message.text.strip()
     amt = context.user_data.get("w_amount")
     if not amt:
-        await update.message.reply_text("از منوی برداشت دوباره شروع کن.")
+        await update.message.reply_text("از منوی برداشت شروع کن.")
         return ConversationHandler.END
     if not is_valid_tron(addr):
-        await update.message.reply_text("❌ آدرس TRON نامعتبر است.")
+        await update.message.reply_text("❌ آدرس TRON نامعتبر.")
         return WAITING_WITHDRAW_ADDRESS
     if amt > get_balance(u.id):
         await update.message.reply_text("❌ موجودی کافی نیست.")
@@ -454,16 +483,14 @@ async def withdraw_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             OWNER_ID,
-            f"🔔 درخواست برداشت #{wid}\n"
-            f"User: `{u.id}`\nAmount: {amt:.4f} TRX\nWallet: `{addr}`",
+            f"🔔 برداشت #{wid}\nUser: `{u.id}`\nAmount: {amt:.4f} TRX\nWallet: `{addr}`",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
         )
     except Exception as e:
         logger.error(f"send owner: {e}")
 
     await update.message.reply_text(
-        "✅ ثبت شد و برای ادمین ارسال شد. مبلغ رزرو شد.",
-        reply_markup=main_menu_kb(),
+        "✅ ثبت شد و برای ادمین ارسال شد.", reply_markup=main_menu_kb()
     )
     return ConversationHandler.END
 
@@ -475,17 +502,13 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM users")
-        total = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM users WHERE is_verified=TRUE")
-        ver = cur.fetchone()[0]
-        cur.execute("SELECT COALESCE(SUM(balance),0) FROM users")
-        tb = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'")
-        pw = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM users"); total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM users WHERE is_verified=TRUE"); ver = cur.fetchone()[0]
+        cur.execute("SELECT COALESCE(SUM(balance),0) FROM users"); tb = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'"); pw = cur.fetchone()[0]
     await update.message.reply_text(
-        f"📊 ادمین\n\n👥 کاربران: {total}\n✅ تایید شده: {ver}\n"
-        f"💰 مجموع موجودی: {tb:.4f} TRX\n⏳ pending: {pw}\n\n"
+        f"📊 ادمین\n\n👥 کاربران: {total}\n✅ تایید: {ver}\n"
+        f"💰 مجموع: {tb:.4f} TRX\n⏳ pending: {pw}\n\n"
         f"/admin_users\n/admin_pending"
     )
 
@@ -511,14 +534,14 @@ async def admin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     with db() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id, user_id, amount, wallet_address, created_at FROM withdrawals "
+            "SELECT id, user_id, amount, wallet_address FROM withdrawals "
             "WHERE status='pending' ORDER BY id"
         )
         rows = cur.fetchall()
     if not rows:
         await update.message.reply_text("pending نداریم.")
         return
-    for wid, uid, amt, w, c in rows:
+    for wid, uid, amt, w in rows:
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ تایید", callback_data=f"approve_{wid}"),
             InlineKeyboardButton("❌ رد", callback_data=f"reject_{wid}"),
@@ -533,15 +556,8 @@ async def withdraw_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if q.from_user.id != OWNER_ID:
         return
-    data = q.data
-    if "_" not in data:
-        return
-    action, sid = data.split("_", 1)
-    try:
-        wid = int(sid)
-    except ValueError:
-        return
-
+    action, sid = q.data.split("_", 1)
+    wid = int(sid)
     with db() as conn, conn.cursor() as cur:
         cur.execute("SELECT user_id, amount, status FROM withdrawals WHERE id=%s", (wid,))
         r = cur.fetchone()
@@ -553,15 +569,10 @@ async def withdraw_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"قبلاً {st} شده.")
             return
         if action == "approve":
-            cur.execute(
-                "UPDATE withdrawals SET status='approved', updated_at=NOW() WHERE id=%s",
-                (wid,),
-            )
+            cur.execute("UPDATE withdrawals SET status='approved', updated_at=NOW() WHERE id=%s", (wid,))
             await q.edit_message_text(f"✅ #{wid} تایید شد.")
             try:
-                await context.bot.send_message(
-                    uid, f"✅ برداشت {amt:.4f} TRX تایید شد."
-                )
+                await context.bot.send_message(uid, f"✅ برداشت {amt:.4f} TRX تایید شد.")
             except Exception as e:
                 logger.error(f"notify user: {e}")
             try:
@@ -573,30 +584,23 @@ async def withdraw_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"publish channel: {e}")
         else:
-            cur.execute(
-                "UPDATE withdrawals SET status='rejected', updated_at=NOW() WHERE id=%s",
-                (wid,),
-            )
-            cur.execute(
-                "UPDATE users SET balance=balance+%s WHERE user_id=%s", (amt, uid)
-            )
+            cur.execute("UPDATE withdrawals SET status='rejected', updated_at=NOW() WHERE id=%s", (wid,))
+            cur.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amt, uid))
             await q.edit_message_text(f"❌ #{wid} رد شد و مبلغ برگشت.")
             try:
-                await context.bot.send_message(
-                    uid, f"❌ برداشت {amt:.4f} TRX رد شد. مبلغ برگشت."
-                )
+                await context.bot.send_message(uid, f"❌ برداشت {amt:.4f} TRX رد شد. مبلغ برگشت.")
             except Exception as e:
                 logger.error(f"notify user: {e}")
 
-# ---------- setup ----------
 async def on_error(update, context):
     logger.error(f"handler error: {context.error!r}", exc_info=context.error)
 
+# ---------- main ----------
 def main():
-    logger.info("🔍 init DB before polling...")
+    logger.info("🔍 init DB...")
     init_db()
 
-    logger.info("🚀 building app...")
+    logger.info("🚀 building Application...")
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -620,15 +624,12 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
-
     menu = MessageHandler(
         filters.Regex(r"^(💰 موجودی|👥 رفرال‌گیری|💸 برداشت|📋 برداشت‌های تایید شده)$"),
         menu_button,
     )
 
-    # دیباگر اول از همه، در گروه -1
     app.add_handler(MessageHandler(filters.ALL, debug_update), group=-1)
-
     app.add_handler(conv)
     app.add_handler(menu)
     app.add_handler(CommandHandler("admin", admin))
@@ -638,33 +639,29 @@ def main():
     app.add_handler(CallbackQueryHandler(withdraw_cb, pattern=r"^(approve|reject)_\d+$"))
     app.add_error_handler(on_error)
 
-    # چک get_me
-    async def _run():
-        me = await app.bot.get_me()
-        logger.info(f"✅ Bot: @{me.username} (id={me.id})")
+    async def preflight():
         try:
-            await app.bot.delete_webhook(drop_pending_updates=True)
-            logger.info("✅ webhook cleared")
+            me = await app.bot.get_me()
+            logger.info(f"✅ getMe OK: @{me.username} (id={me.id})")
         except Exception as e:
-            logger.warning(f"delete_webhook: {e}")
-        logger.info("✅ starting polling...")
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=False,
-        )
-        # نگه‌داشتن پروسه
-        stop = asyncio.Event()
-        await stop.wait()
+            logger.critical(f"❌ getMe FAILED: {e!r}", exc_info=True)
+            raise
+        try:
+            ok = await app.bot.delete_webhook(drop_pending_updates=True)
+            logger.info(f"✅ deleteWebhook: {ok}")
+        except Exception as e:
+            logger.warning(f"deleteWebhook: {e}")
 
-    try:
-        asyncio.run(_run())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("stopped by user")
-    except Exception as e:
-        logger.critical(f"FATAL: {e}", exc_info=True)
-        raise
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(preflight())
+
+    logger.info("✅ starting polling...")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+        close_loop=False,
+    )
 
 if __name__ == "__main__":
     main()

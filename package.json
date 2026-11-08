@@ -1,0 +1,13 @@
+{
+  "name": "telegram-tron-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "dotenv": "^16.4.7",
+    "telegraf": "^4.16.3"
+  }
+}

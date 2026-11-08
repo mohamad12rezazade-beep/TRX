@@ -12,7 +12,6 @@ from telegram import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
@@ -24,46 +23,46 @@ from telegram.ext import (
     filters,
 )
 
-# =========================
+# =========================================================
 # CONFIG
-# =========================
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID_RAW = os.getenv("OWNER_ID")
+OWNER_ID = os.getenv("OWNER_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
-if not OWNER_ID_RAW:
+if not OWNER_ID:
     raise RuntimeError("OWNER_ID is missing")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing")
 
-OWNER_ID = int(OWNER_ID_RAW)
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
-logger = logging.getLogger(__name__)
+OWNER_ID = int(OWNER_ID)
 
 MIN_WITHDRAW = Decimal("2")
 REFERRAL_REWARD = Decimal("0.2")
 
 PAYMENT_CHANNEL = "@BET_1XZX"
 
-REQUIRED_CHANNELS = [
+DEFAULT_CHANNELS = [
     "@BET_1XZX",
     "@GAP_BAZIN1",
 ]
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 
-# =========================
+logger = logging.getLogger(__name__)
+
+
+# =========================================================
 # DATABASE
-# =========================
+# =========================================================
 
 def db():
     return psycopg.connect(
@@ -108,7 +107,7 @@ def init_db():
                 )
             """)
 
-            for channel in REQUIRED_CHANNELS:
+            for channel in DEFAULT_CHANNELS:
                 cur.execute(
                     """
                     INSERT INTO required_channels(channel)
@@ -120,12 +119,30 @@ def init_db():
 
         conn.commit()
 
+    logger.info("Database initialized")
 
-# =========================
-# USER FUNCTIONS
-# =========================
 
-def get_user(user_id: int):
+# =========================================================
+# USER
+# =========================================================
+
+def create_user(user_id, referred_by=None):
+    with db() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                INSERT INTO users(id, referred_by)
+                VALUES (%s, %s)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (user_id, referred_by),
+            )
+
+        conn.commit()
+
+
+def get_user(user_id):
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -135,21 +152,7 @@ def get_user(user_id: int):
             return cur.fetchone()
 
 
-def create_user(user_id: int, referred_by=None):
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO users(id, referred_by)
-                VALUES (%s, %s)
-                ON CONFLICT (id) DO NOTHING
-                """,
-                (user_id, referred_by),
-            )
-        conn.commit()
-
-
-def set_phone(user_id: int, phone: str):
+def set_phone(user_id, phone):
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -161,10 +164,11 @@ def set_phone(user_id: int, phone: str):
                 """,
                 (phone, user_id),
             )
+
         conn.commit()
 
 
-def get_balance(user_id: int):
+def get_balance(user_id):
     user = get_user(user_id)
 
     if not user:
@@ -173,33 +177,245 @@ def get_balance(user_id: int):
     return Decimal(str(user["balance"]))
 
 
-def add_balance(user_id: int, amount: Decimal):
+# =========================================================
+# CHANNELS
+# =========================================================
+
+def get_required_channels():
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE users
-                SET balance = balance + %s
-                WHERE id = %s
-                """,
-                (amount, user_id),
+            cur.execute("""
+                SELECT channel
+                FROM required_channels
+                ORDER BY id
+            """)
+            rows = cur.fetchall()
+
+    return [x["channel"] for x in rows]
+
+
+def channel_keyboard():
+    buttons = []
+
+    for channel in get_required_channels():
+
+        username = channel.replace("@", "").strip()
+
+        buttons.append([
+            InlineKeyboardButton(
+                f"📢 عضویت در {channel}",
+                url=f"https://t.me/{username}",
             )
-        conn.commit()
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "✅ بررسی عضویت",
+            callback_data="check_membership",
+        )
+    ])
+
+    return InlineKeyboardMarkup(buttons)
 
 
-# =========================
-# REFERRAL
-# =========================
+async def is_member(bot, user_id):
+    for channel in get_required_channels():
 
-def reward_referral_if_needed(user_id: int):
+        try:
+            member = await bot.get_chat_member(
+                chat_id=channel,
+                user_id=user_id,
+            )
+
+            if member.status in (
+                ChatMemberStatus.LEFT,
+                ChatMemberStatus.KICKED,
+            ):
+                return False
+
+        except Exception as e:
+            logger.error(
+                "Membership error for %s: %s",
+                channel,
+                e,
+            )
+            return False
+
+    return True
+
+
+# =========================================================
+# MAIN MENU
+# =========================================================
+
+def main_menu():
+    return ReplyKeyboardMarkup(
+        [
+            ["💸 برداشت", "👥 رفرالگیری"],
+            ["💰 موجودی", "📋 برداشت های تایید شده"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+# =========================================================
+# /START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    referred_by = None
+
+    if context.args:
+
+        try:
+            ref = int(context.args[0])
+
+            if ref != user.id:
+                referred_by = ref
+
+        except Exception:
+            pass
+
+    create_user(
+        user.id,
+        referred_by,
+    )
+
+    current = get_user(user.id)
+
+    if current and current["verified"]:
+
+        if await is_member(
+            context.bot,
+            user.id,
+        ):
+            await update.message.reply_text(
+                "👋 خوش اومدی",
+                reply_markup=main_menu(),
+            )
+            return
+
+    await update.message.reply_text(
+        "سلام 👋\n\n"
+        "برای شروع، شماره موبایل ایرانیت رو ارسال کن:",
+        reply_markup=ReplyKeyboardMarkup(
+            [
+                [
+                    KeyboardButton(
+                        "📱 ارسال شماره موبایل",
+                        request_contact=True,
+                    )
+                ]
+            ],
+            resize_keyboard=True,
+        ),
+    )
+
+
+# =========================================================
+# PHONE
+# =========================================================
+
+def normalize_phone(phone):
+
+    phone = (
+        phone
+        .replace(" ", "")
+        .replace("-", "")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+    if re.fullmatch(r"\+989\d{9}", phone):
+        return phone
+
+    if re.fullmatch(r"00989\d{9}", phone):
+        return "+98" + phone[4:]
+
+    if re.fullmatch(r"09\d{9}", phone):
+        return "+98" + phone[1:]
+
+    return None
+
+
+async def contact_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    contact = update.message.contact
+    user = update.effective_user
+
+    if (
+        contact.user_id is not None
+        and contact.user_id != user.id
+    ):
+        await update.message.reply_text(
+            "❌ فقط شماره خودت رو ارسال کن."
+        )
+        return
+
+    phone = normalize_phone(
+        contact.phone_number
+    )
+
+    if not phone:
+        await update.message.reply_text(
+            "❌ فقط شماره موبایل ایران قابل قبول است."
+        )
+        return
+
+    create_user(user.id)
+
+    set_phone(
+        user.id,
+        phone,
+    )
+
+    if not await is_member(
+        context.bot,
+        user.id,
+    ):
+
+        await update.message.reply_text(
+            "✅ شماره تأیید شد.\n\n"
+            "حالا عضو کانال‌های زیر شو:",
+            reply_markup=channel_keyboard(),
+        )
+
+        return
+
+    reward_referral(user.id)
+
+    await update.message.reply_text(
+        "✅ ثبت‌نام کامل شد.",
+        reply_markup=main_menu(),
+    )
+
+
+# =========================================================
+# REFERRAL REWARD
+# =========================================================
+
+def reward_referral(user_id):
+
     with db() as conn:
         with conn.cursor() as cur:
 
             cur.execute(
                 """
-                SELECT referred_by, referral_rewarded
+                SELECT referred_by,
+                       referral_rewarded,
+                       verified
                 FROM users
                 WHERE id = %s
+                FOR UPDATE
                 """,
                 (user_id,),
             )
@@ -209,26 +425,15 @@ def reward_referral_if_needed(user_id: int):
             if not user:
                 return
 
-            if not user["referred_by"]:
+            if not user["verified"]:
                 return
 
             if user["referral_rewarded"]:
                 return
 
-            referrer_id = user["referred_by"]
+            referrer = user["referred_by"]
 
-            cur.execute(
-                """
-                SELECT verified
-                FROM users
-                WHERE id = %s
-                """,
-                (user_id,),
-            )
-
-            referred = cur.fetchone()
-
-            if not referred or not referred["verified"]:
+            if not referrer:
                 return
 
             cur.execute(
@@ -237,7 +442,10 @@ def reward_referral_if_needed(user_id: int):
                 SET balance = balance + %s
                 WHERE id = %s
                 """,
-                (REFERRAL_REWARD, referrer_id),
+                (
+                    REFERRAL_REWARD,
+                    referrer,
+                ),
             )
 
             cur.execute(
@@ -252,211 +460,17 @@ def reward_referral_if_needed(user_id: int):
         conn.commit()
 
 
-# =========================
-# CHANNELS
-# =========================
-
-def get_required_channels():
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT channel
-                FROM required_channels
-                ORDER BY id
-            """)
-            rows = cur.fetchall()
-
-    return [row["channel"] for row in rows]
-
-
-async def check_membership(bot, user_id: int):
-    channels = get_required_channels()
-
-    for channel in channels:
-        try:
-            member = await bot.get_chat_member(channel, user_id)
-
-            if member.status in (
-                ChatMemberStatus.LEFT,
-                ChatMemberStatus.KICKED,
-            ):
-                return False
-
-        except Exception as e:
-            logger.error(
-                "Membership check failed for %s: %s",
-                channel,
-                e,
-            )
-            return False
-
-    return True
-
-
-def channel_keyboard():
-    channels = get_required_channels()
-
-    buttons = []
-
-    for channel in channels:
-        clean = channel.replace("@", "")
-        buttons.append([
-            InlineKeyboardButton(
-                f"عضویت در {channel}",
-                url=f"https://t.me/{clean}",
-            )
-        ])
-
-    buttons.append([
-        InlineKeyboardButton(
-            "✅ بررسی عضویت",
-            callback_data="check_membership",
-        )
-    ])
-
-    return InlineKeyboardMarkup(buttons)
-
-
-# =========================
-# MAIN KEYBOARD
-# =========================
-
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            ["💸 برداشت", "👥 رفرالگیری"],
-            ["💰 موجودی", "📋 برداشت های تایید شده"],
-        ],
-        resize_keyboard=True,
-    )
-
-
-# =========================
-# START
-# =========================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-
-    if not user:
-        return
-
-    referred_by = None
-
-    if context.args:
-        try:
-            ref_id = int(context.args[0])
-
-            if ref_id != user.id:
-                referred_by = ref_id
-
-        except ValueError:
-            pass
-
-    create_user(user.id, referred_by)
-
-    current = get_user(user.id)
-
-    if current and current["verified"]:
-        if await check_membership(context.bot, user.id):
-            await update.message.reply_text(
-                "به ربات خوش اومدی 👋",
-                reply_markup=main_keyboard(),
-            )
-            return
-
-    await update.message.reply_text(
-        "سلام 👋\n\n"
-        "برای استفاده از ربات ابتدا شماره موبایل ایرانیت رو ارسال کن.",
-        reply_markup=ReplyKeyboardMarkup(
-            [
-                [
-                    KeyboardButton(
-                        "📱 ارسال شماره موبایل",
-                        request_contact=True,
-                    )
-                ]
-            ],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        ),
-    )
-
-
-# =========================
-# PHONE
-# =========================
-
-def normalize_iran_phone(phone: str):
-    phone = phone.replace(" ", "").replace("-", "")
-
-    if phone.startswith("+98"):
-        if re.fullmatch(r"\+989\d{9}", phone):
-            return phone
-        return None
-
-    if phone.startswith("0098"):
-        if re.fullmatch(r"00989\d{9}", phone):
-            return "+98" + phone[4:]
-        return None
-
-    if phone.startswith("09"):
-        if re.fullmatch(r"09\d{9}", phone):
-            return "+98" + phone[1:]
-        return None
-
-    return None
-
-
-async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    contact = update.message.contact
-    user = update.effective_user
-
-    if contact.user_id and contact.user_id != user.id:
-        await update.message.reply_text(
-            "❌ لطفاً شماره خودت رو ارسال کن."
-        )
-        return
-
-    phone = normalize_iran_phone(contact.phone_number)
-
-    if not phone:
-        await update.message.reply_text(
-            "❌ فقط شماره موبایل ایران (+98) قابل قبول است."
-        )
-        return
-
-    create_user(user.id)
-    set_phone(user.id, phone)
-
-    if not await check_membership(context.bot, user.id):
-        await update.message.reply_text(
-            "شماره تأیید شد ✅\n\n"
-            "حالا عضو کانال‌های زیر شو و سپس روی بررسی عضویت بزن:",
-            reply_markup=channel_keyboard(),
-        )
-        return
-
-    reward_referral_if_needed(user.id)
-
-    await update.message.reply_text(
-        "احراز هویت انجام شد ✅",
-        reply_markup=main_keyboard(),
-    )
-
-
-# =========================
+# =========================================================
 # CHECK MEMBERSHIP
-# =========================
+# =========================================================
 
-async def check_membership_callback(
+async def membership_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
     query = update.callback_query
+
     await query.answer()
 
     user_id = query.from_user.id
@@ -465,60 +479,74 @@ async def check_membership_callback(
 
     if not user or not user["verified"]:
         await query.message.reply_text(
-            "ابتدا شماره موبایل ایرانیت رو ارسال کن."
+            "❌ ابتدا شماره موبایلت رو ارسال کن."
         )
         return
 
-    if not await check_membership(context.bot, user_id):
+    if not await is_member(
+        context.bot,
+        user_id,
+    ):
         await query.message.reply_text(
-            "❌ هنوز عضو همه کانال‌های لازم نیستی.",
+            "❌ هنوز عضو همه کانال‌ها نیستی.",
             reply_markup=channel_keyboard(),
         )
         return
 
-    reward_referral_if_needed(user_id)
+    reward_referral(user_id)
 
     await query.message.reply_text(
-        "عضویت تأیید شد ✅",
-        reply_markup=main_keyboard(),
+        "✅ عضویت تأیید شد.",
+        reply_markup=main_menu(),
     )
 
 
-# =========================
+# =========================================================
 # BALANCE
-# =========================
+# =========================================================
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def balance_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-    user_id = update.effective_user.id
-
-    user = get_user(user_id)
+    user = get_user(
+        update.effective_user.id
+    )
 
     if not user or not user["verified"]:
         await update.message.reply_text(
-            "ابتدا /start رو بزن و احراز هویت کن."
+            "❌ ابتدا /start رو بزن."
         )
         return
 
-    amount = get_balance(user_id)
+    balance = get_balance(
+        update.effective_user.id
+    )
 
     await update.message.reply_text(
         f"💰 موجودی شما:\n\n"
-        f"{amount:.8f} TRX"
+        f"{balance:.8f} TRX"
     )
 
 
-# =========================
+# =========================================================
 # REFERRAL
-# =========================
+# =========================================================
 
-async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def referral_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
     user_id = update.effective_user.id
 
     bot = await context.bot.get_me()
 
-    link = f"https://t.me/{bot.username}?start={user_id}"
+    link = (
+        f"https://t.me/{bot.username}"
+        f"?start={user_id}"
+    )
 
     with db() as conn:
         with conn.cursor() as cur:
@@ -536,73 +564,84 @@ async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             cur.execute(
                 """
-                SELECT COALESCE(
-                    SUM(CASE WHEN referral_rewarded THEN 0.2 ELSE 0 END),
-                    0
-                ) AS total
+                SELECT COUNT(*) AS rewarded
                 FROM users
                 WHERE referred_by = %s
+                AND referral_rewarded = TRUE
                 """,
                 (user_id,),
             )
 
-            total = Decimal(str(cur.fetchone()["total"]))
+            rewarded = cur.fetchone()["rewarded"]
+
+    total = Decimal(str(rewarded)) * REFERRAL_REWARD
 
     await update.message.reply_text(
-        f"👥 رفرال شما:\n\n"
+        "👥 رفرالگیری\n\n"
         f"تعداد زیرمجموعه: {count}\n"
         f"پاداش دریافت‌شده: {total:.2f} TRX\n\n"
         f"🔗 لینک دعوت:\n{link}"
     )
 
 
-# =========================
-# WITHDRAW
-# =========================
+# =========================================================
+# WITHDRAW START
+# =========================================================
 
-async def withdraw_start(
+async def withdraw_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    user_id = update.effective_user.id
-
-    user = get_user(user_id)
+    user = get_user(
+        update.effective_user.id
+    )
 
     if not user or not user["verified"]:
         await update.message.reply_text(
-            "ابتدا احراز هویت کن."
+            "❌ ابتدا احراز هویت کن."
         )
         return
 
-    balance = get_balance(user_id)
+    balance = get_balance(
+        update.effective_user.id
+    )
 
     if balance < MIN_WITHDRAW:
         await update.message.reply_text(
             f"❌ حداقل برداشت {MIN_WITHDRAW} TRX است.\n\n"
-            f"موجودی شما: {balance:.8f} TRX"
+            f"موجودی: {balance:.8f} TRX"
         )
         return
 
+    context.user_data.clear()
     context.user_data["withdraw_step"] = "amount"
 
     await update.message.reply_text(
-        f"موجودی: {balance:.8f} TRX\n\n"
-        "مقدار برداشت را به TRX وارد کن:"
+        f"💰 موجودی: {balance:.8f} TRX\n\n"
+        "مقدار برداشت را وارد کن:"
     )
 
 
-async def handle_withdraw_text(
+# =========================================================
+# WITHDRAW TEXT
+# =========================================================
+
+async def withdrawal_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    step = context.user_data.get("withdraw_step")
+    step = context.user_data.get(
+        "withdraw_step"
+    )
 
     if step == "amount":
 
         try:
-            amount = Decimal(update.message.text.strip())
+            amount = Decimal(
+                update.message.text.strip()
+            )
 
         except InvalidOperation:
             await update.message.reply_text(
@@ -610,7 +649,9 @@ async def handle_withdraw_text(
             )
             return
 
-        balance = get_balance(update.effective_user.id)
+        balance = get_balance(
+            update.effective_user.id
+        )
 
         if amount < MIN_WITHDRAW:
             await update.message.reply_text(
@@ -624,26 +665,37 @@ async def handle_withdraw_text(
             )
             return
 
-        context.user_data["withdraw_amount"] = str(amount)
-        context.user_data["withdraw_step"] = "wallet"
+        context.user_data[
+            "withdraw_amount"
+        ] = str(amount)
+
+        context.user_data[
+            "withdraw_step"
+        ] = "wallet"
 
         await update.message.reply_text(
-            "آدرس کیف پول TRON خودت رو ارسال کن:"
+            "آدرس کیف پول TRON را ارسال کن:"
         )
+
         return
 
     if step == "wallet":
 
         wallet = update.message.text.strip()
 
-        if not re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", wallet):
+        if not re.fullmatch(
+            r"T[1-9A-HJ-NP-Za-km-z]{33}",
+            wallet,
+        ):
             await update.message.reply_text(
-                "❌ آدرس TRON نامعتبر است."
+                "❌ آدرس TRON معتبر نیست."
             )
             return
 
         amount = Decimal(
-            context.user_data["withdraw_amount"]
+            context.user_data[
+                "withdraw_amount"
+            ]
         )
 
         user_id = update.effective_user.id
@@ -661,15 +713,17 @@ async def handle_withdraw_text(
                     (user_id,),
                 )
 
-                row = cur.fetchone()
+                user = cur.fetchone()
 
-                if not row:
+                if not user:
                     await update.message.reply_text(
                         "❌ کاربر پیدا نشد."
                     )
                     return
 
-                balance = Decimal(str(row["balance"]))
+                balance = Decimal(
+                    str(user["balance"])
+                )
 
                 if amount > balance:
                     await update.message.reply_text(
@@ -683,7 +737,10 @@ async def handle_withdraw_text(
                     SET balance = balance - %s
                     WHERE id = %s
                     """,
-                    (amount, user_id),
+                    (
+                        amount,
+                        user_id,
+                    ),
                 )
 
                 cur.execute(
@@ -694,7 +751,12 @@ async def handle_withdraw_text(
                         wallet,
                         status
                     )
-                    VALUES (%s, %s, %s, 'pending')
+                    VALUES (
+                        %s,
+                        %s,
+                        %s,
+                        'pending'
+                    )
                     RETURNING id
                     """,
                     (
@@ -714,10 +776,9 @@ async def handle_withdraw_text(
 
         await update.message.reply_text(
             "✅ درخواست برداشت ثبت شد.\n\n"
-            f"مقدار: {amount} TRX\n"
-            f"شماره درخواست: #{withdrawal_id}\n\n"
-            "بعد از بررسی ادمین نتیجه اعلام می‌شود.",
-            reply_markup=main_keyboard(),
+            f"مبلغ: {amount} TRX\n"
+            f"شماره درخواست: #{withdrawal_id}",
+            reply_markup=main_menu(),
         )
 
         keyboard = InlineKeyboardMarkup(
@@ -735,37 +796,81 @@ async def handle_withdraw_text(
             ]
         )
 
-        try:
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=(
-                    "💸 درخواست برداشت جدید\n\n"
-                    f"کاربر: {user_id}\n"
-                    f"مقدار: {amount} TRX\n"
-                    f"کیف پول: {wallet}\n"
-                    f"درخواست: #{withdrawal_id}"
-                ),
-                reply_markup=keyboard,
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                "💸 درخواست برداشت\n\n"
+                f"👤 User ID: {user_id}\n"
+                f"💰 Amount: {amount} TRX\n"
+                f"💳 Wallet: {wallet}\n"
+                f"🆔 Request: #{withdrawal_id}"
+            ),
+            reply_markup=keyboard,
+        )
+
+
+# =========================================================
+# APPROVED WITHDRAWALS
+# =========================================================
+
+async def approved_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user_id = update.effective_user.id
+
+    with db() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT id, amount
+                FROM withdrawals
+                WHERE user_id = %s
+                AND status = 'approved'
+                ORDER BY id DESC
+                LIMIT 20
+                """,
+                (user_id,),
             )
-        except Exception as e:
-            logger.error("Cannot send admin message: %s", e)
+
+            rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text(
+            "📋 هنوز برداشت تاییدشده‌ای نداری."
+        )
+        return
+
+    text = "📋 برداشت‌های تایید شده:\n\n"
+
+    for row in rows:
+        text += (
+            f"#{row['id']} — "
+            f"{Decimal(str(row['amount']))} TRX\n"
+        )
+
+    await update.message.reply_text(text)
 
 
-# =========================
+# =========================================================
 # ADMIN
-# =========================
+# =========================================================
 
-def is_admin(user_id: int):
+def is_admin(user_id):
     return user_id == OWNER_ID
 
 
-async def admin_command(
+async def admin_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ دسترسی ندارید.")
+        await update.message.reply_text(
+            "❌ دسترسی ندارید."
+        )
         return
 
     keyboard = ReplyKeyboardMarkup(
@@ -794,48 +899,55 @@ async def admin_stats(
     with db() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
-                SELECT COUNT(*) AS total
-                FROM users
-            """)
-            total = cur.fetchone()["total"]
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM users"
+            )
+            total = cur.fetchone()["n"]
 
-            cur.execute("""
-                SELECT COUNT(*) AS verified
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
                 FROM users
                 WHERE verified = TRUE
-            """)
-            verified = cur.fetchone()["verified"]
+                """
+            )
+            verified = cur.fetchone()["n"]
 
-            cur.execute("""
-                SELECT COUNT(*) AS referrals
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
                 FROM users
                 WHERE referred_by IS NOT NULL
-            """)
-            referrals = cur.fetchone()["referrals"]
+                """
+            )
+            referrals = cur.fetchone()["n"]
 
-            cur.execute("""
-                SELECT COALESCE(SUM(balance), 0) AS balance
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(balance), 0) AS total
                 FROM users
-            """)
-            balance = Decimal(
-                str(cur.fetchone()["balance"])
+                """
+            )
+            total_balance = Decimal(
+                str(cur.fetchone()["total"])
             )
 
-            cur.execute("""
-                SELECT COUNT(*) AS pending
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
                 FROM withdrawals
                 WHERE status = 'pending'
-            """)
-            pending = cur.fetchone()["pending"]
+                """
+            )
+            pending = cur.fetchone()["n"]
 
     await update.message.reply_text(
         "📊 آمار کاربران\n\n"
         f"👤 کل کاربران: {total}\n"
         f"✅ احراز شده: {verified}\n"
-        f"👥 رفرال‌ها: {referrals}\n"
-        f"💰 مجموع موجودی: {balance:.8f} TRX\n"
-        f"💸 برداشت‌های در انتظار: {pending}"
+        f"👥 دارای رفرال: {referrals}\n"
+        f"💰 مجموع موجودی: {total_balance:.8f} TRX\n"
+        f"💸 برداشت در انتظار: {pending}"
     )
 
 
@@ -849,40 +961,44 @@ async def admin_balances(
 
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+
+            cur.execute(
+                """
                 SELECT
                     id,
                     phone,
-                    balance,
-                    verified
+                    verified,
+                    balance
                 FROM users
-                ORDER BY balance DESC
+                ORDER BY id DESC
                 LIMIT 50
-            """)
+                """
+            )
 
-            users = cur.fetchall()
+            rows = cur.fetchall()
 
-    if not users:
+    if not rows:
         await update.message.reply_text(
-            "هیچ کاربری ثبت نشده."
+            "هیچ کاربری وجود ندارد."
         )
         return
 
-    text = "💰 موجودی کاربران\n\n"
+    text = "💰 کاربران\n\n"
 
-    for user in users:
+    for row in rows:
+
         text += (
-            f"ID: {user['id']}\n"
-            f"شماره: {user['phone'] or '-'}\n"
-            f"موجودی: {Decimal(str(user['balance'])):.8f} TRX\n"
-            f"تأیید: {'✅' if user['verified'] else '❌'}\n"
+            f"👤 {row['id']}\n"
+            f"📱 {row['phone'] or '-'}\n"
+            f"💰 {Decimal(str(row['balance'])):.8f} TRX\n"
+            f"🔐 {'تأیید شده' if row['verified'] else 'تأیید نشده'}\n"
             f"────────────\n"
         )
 
     await update.message.reply_text(text)
 
 
-async def pending_withdrawals(
+async def admin_pending(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
@@ -892,19 +1008,22 @@ async def pending_withdrawals(
 
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+
+            cur.execute(
+                """
                 SELECT *
                 FROM withdrawals
                 WHERE status = 'pending'
                 ORDER BY id DESC
                 LIMIT 20
-            """)
+                """
+            )
 
             rows = cur.fetchall()
 
     if not rows:
         await update.message.reply_text(
-            "برداشت در انتظاری وجود ندارد."
+            "هیچ برداشت در انتظاری نیست."
         )
         return
 
@@ -927,16 +1046,16 @@ async def pending_withdrawals(
 
         await update.message.reply_text(
             f"💸 درخواست #{row['id']}\n\n"
-            f"کاربر: {row['user_id']}\n"
-            f"مقدار: {Decimal(str(row['amount']))} TRX\n"
-            f"کیف پول: {row['wallet']}",
+            f"👤 کاربر: {row['user_id']}\n"
+            f"💰 مبلغ: {Decimal(str(row['amount']))} TRX\n"
+            f"💳 کیف پول: {row['wallet']}",
             reply_markup=keyboard,
         )
 
 
-# =========================
+# =========================================================
 # APPROVE / REJECT
-# =========================
+# =========================================================
 
 async def withdrawal_action(
     update: Update,
@@ -944,7 +1063,6 @@ async def withdrawal_action(
 ):
 
     query = update.callback_query
-    await query.answer()
 
     if not is_admin(query.from_user.id):
         await query.answer(
@@ -953,8 +1071,10 @@ async def withdrawal_action(
         )
         return
 
-    action, withdrawal_id = query.data.split(":")
-    withdrawal_id = int(withdrawal_id)
+    await query.answer()
+
+    action, raw_id = query.data.split(":")
+    withdrawal_id = int(raw_id)
 
     with db() as conn:
         with conn.cursor() as cur:
@@ -964,6 +1084,7 @@ async def withdrawal_action(
                 SELECT *
                 FROM withdrawals
                 WHERE id = %s
+                FOR UPDATE
                 """,
                 (withdrawal_id,),
             )
@@ -994,8 +1115,6 @@ async def withdrawal_action(
                     (withdrawal_id,),
                 )
 
-                status_text = "approved"
-
             else:
 
                 cur.execute(
@@ -1020,11 +1139,13 @@ async def withdrawal_action(
                     (withdrawal_id,),
                 )
 
-                status_text = "rejected"
-
         conn.commit()
 
-    if status_text == "approved":
+    amount = Decimal(
+        str(withdrawal["amount"])
+    )
+
+    if action == "approve":
 
         await query.message.edit_text(
             f"✅ درخواست #{withdrawal_id} تایید شد."
@@ -1034,8 +1155,8 @@ async def withdrawal_action(
             await context.bot.send_message(
                 chat_id=withdrawal["user_id"],
                 text=(
-                    "✅ درخواست برداشت شما تایید شد.\n\n"
-                    f"مبلغ: {Decimal(str(withdrawal['amount']))} TRX"
+                    "✅ برداشت شما تأیید شد.\n\n"
+                    f"مبلغ: {amount} TRX"
                 ),
             )
 
@@ -1044,13 +1165,13 @@ async def withdrawal_action(
                 text=(
                     "💸 برداشت تایید شد\n\n"
                     f"👤 User ID: {withdrawal['user_id']}\n"
-                    f"💰 Amount: {Decimal(str(withdrawal['amount']))} TRX"
+                    f"💰 Amount: {amount} TRX"
                 ),
             )
 
         except Exception as e:
             logger.error(
-                "Could not notify approved withdrawal: %s",
+                "Notification error: %s",
                 e,
             )
 
@@ -1068,62 +1189,19 @@ async def withdrawal_action(
                     "مبلغ به موجودی شما برگشت داده شد."
                 ),
             )
+
         except Exception as e:
             logger.error(
-                "Could not notify rejected withdrawal: %s",
+                "Reject notification error: %s",
                 e,
             )
 
 
-# =========================
-# APPROVED WITHDRAWALS
-# =========================
+# =========================================================
+# CHANNEL ADMIN
+# =========================================================
 
-async def approved_withdrawals(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    user_id = update.effective_user.id
-
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, amount, created_at
-                FROM withdrawals
-                WHERE user_id = %s
-                AND status = 'approved'
-                ORDER BY id DESC
-                LIMIT 20
-                """,
-                (user_id,),
-            )
-
-            rows = cur.fetchall()
-
-    if not rows:
-        await update.message.reply_text(
-            "📋 هنوز برداشت تاییدشده‌ای نداری."
-        )
-        return
-
-    text = "📋 برداشت‌های تایید شده:\n\n"
-
-    for row in rows:
-        text += (
-            f"#{row['id']} — "
-            f"{Decimal(str(row['amount']))} TRX\n"
-        )
-
-    await update.message.reply_text(text)
-
-
-# =========================
-# REQUIRED CHANNELS ADMIN
-# =========================
-
-async def admin_channels(
+async def channels_admin(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
@@ -1133,18 +1211,18 @@ async def admin_channels(
 
     channels = get_required_channels()
 
-    if not channels:
-        text = "📢 هیچ کانال اجباری ثبت نشده."
-    else:
-        text = "📢 کانال‌های اجباری:\n\n"
+    text = "📢 کانال‌های اجباری\n\n"
 
+    if channels:
         for i, channel in enumerate(channels, 1):
             text += f"{i}. {channel}\n"
+    else:
+        text += "هیچ کانالی ثبت نشده.\n"
 
     text += (
-        "\nبرای اضافه کردن:\n"
+        "\n➕ اضافه کردن:\n"
         "/addchannel @channel\n\n"
-        "برای حذف:\n"
+        "➖ حذف کردن:\n"
         "/removechannel @channel"
     )
 
@@ -1161,7 +1239,7 @@ async def add_channel(
 
     if not context.args:
         await update.message.reply_text(
-            "مثال:\n/addchannel @channel"
+            "مثال:\n/addchannel @mychannel"
         )
         return
 
@@ -1183,7 +1261,7 @@ async def add_channel(
         conn.commit()
 
     await update.message.reply_text(
-        f"✅ کانال {channel} اضافه شد."
+        f"✅ {channel} اضافه شد."
     )
 
 
@@ -1197,7 +1275,7 @@ async def remove_channel(
 
     if not context.args:
         await update.message.reply_text(
-            "مثال:\n/removechannel @channel"
+            "مثال:\n/removechannel @mychannel"
         )
         return
 
@@ -1218,13 +1296,13 @@ async def remove_channel(
         conn.commit()
 
     await update.message.reply_text(
-        f"🗑 کانال {channel} حذف شد."
+        f"🗑 {channel} حذف شد."
     )
 
 
-# =========================
-# TEXT HANDLER
-# =========================
+# =========================================================
+# TEXT
+# =========================================================
 
 async def text_handler(
     update: Update,
@@ -1234,125 +1312,170 @@ async def text_handler(
     text = update.message.text
 
     if context.user_data.get("withdraw_step"):
-        await handle_withdraw_text(
+        await withdrawal_text(
             update,
             context,
         )
         return
 
     if text == "💰 موجودی":
-        await balance(update, context)
+        await balance_handler(
+            update,
+            context,
+        )
         return
 
     if text == "👥 رفرالگیری":
-        await referral(update, context)
+        await referral_handler(
+            update,
+            context,
+        )
         return
 
     if text == "💸 برداشت":
-        await withdraw_start(update, context)
+        await withdraw_handler(
+            update,
+            context,
+        )
         return
 
     if text == "📋 برداشت های تایید شده":
-        await approved_withdrawals(update, context)
+        await approved_handler(
+            update,
+            context,
+        )
         return
 
     if text == "📊 آمار کاربران":
-        await admin_stats(update, context)
+        await admin_stats(
+            update,
+            context,
+        )
         return
 
     if text == "💰 موجودی کاربران":
-        await admin_balances(update, context)
+        await admin_balances(
+            update,
+            context,
+        )
         return
 
     if text == "💸 برداشت‌های در انتظار":
-        await pending_withdrawals(update, context)
+        await admin_pending(
+            update,
+            context,
+        )
         return
 
     if text == "📢 کانال‌های اجباری":
-        await admin_channels(update, context)
+        await channels_admin(
+            update,
+            context,
+        )
         return
 
 
-# =========================
+# =========================================================
 # ERROR
-# =========================
+# =========================================================
 
 async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
+    update,
+    context,
 ):
 
-    logger.exception(
-        "Unhandled exception",
+    logger.error(
+        "Unhandled error:",
         exc_info=context.error,
     )
 
 
-# =========================
+# =========================================================
 # MAIN
-# =========================
+# =========================================================
 
 def main():
 
-    logger.info("Starting bot...")
+    logger.info("Starting Telegram bot...")
 
     init_db()
 
-    application = (
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    application.add_handler(
-        CommandHandler("start", start)
+    # /start
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
     )
 
-    application.add_handler(
-        CommandHandler("admin", admin_command)
+    # /admin
+    app.add_handler(
+        CommandHandler(
+            "admin",
+            admin_handler,
+        )
     )
 
-    application.add_handler(
-        CommandHandler("addchannel", add_channel)
+    # Admin channels
+    app.add_handler(
+        CommandHandler(
+            "addchannel",
+            add_channel,
+        )
     )
 
-    application.add_handler(
-        CommandHandler("removechannel", remove_channel)
+    app.add_handler(
+        CommandHandler(
+            "removechannel",
+            remove_channel,
+        )
     )
 
-    application.add_handler(
+    # Contact
+    app.add_handler(
         MessageHandler(
             filters.CONTACT,
-            handle_contact,
+            contact_handler,
         )
     )
 
-    application.add_handler(
+    # Membership
+    app.add_handler(
         CallbackQueryHandler(
-            check_membership_callback,
-            pattern="^check_membership$",
+            membership_callback,
+            pattern=r"^check_membership$",
         )
     )
 
-    application.add_handler(
+    # Withdrawal approve/reject
+    app.add_handler(
         CallbackQueryHandler(
             withdrawal_action,
             pattern=r"^(approve|reject):\d+$",
         )
     )
 
-    application.add_handler(
+    # Normal text
+    app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             text_handler,
         )
     )
 
-    application.add_error_handler(error_handler)
+    app.add_error_handler(
+        error_handler
+    )
 
-    logger.info("Bot is running...")
+    logger.info("BOT STARTED")
 
-    application.run_polling(
+    app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=False,
     )

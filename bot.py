@@ -70,11 +70,6 @@ def init_db():
             );
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS required_channels (
-                channel_username TEXT PRIMARY KEY
-            );
-        """)
-        cur.execute("""
             CREATE TABLE IF NOT EXISTS referral_logs (
                 id SERIAL PRIMARY KEY,
                 referrer_id BIGINT,
@@ -83,9 +78,29 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+
+        # --- required_channels: اگر ساختار قدیمی بود، بازسازی کن ---
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'required_channels';
+        """)
+        cols = [r[0] for r in cur.fetchall()]
+        if cols and "channel_username" not in cols:
+            logger.warning(f"⚠️ required_channels ساختار قدیمی دارد ({cols}). در حال بازسازی...")
+            cur.execute("DROP TABLE required_channels CASCADE;")
+            cols = []
+
+        if not cols:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS required_channels (
+                    channel_username TEXT PRIMARY KEY
+                );
+            """)
+
         for ch in REQUIRED_CHANNELS:
             cur.execute(
-                "INSERT INTO required_channels(channel_username) VALUES (%s) ON CONFLICT DO NOTHING",
+                "INSERT INTO required_channels(channel_username) VALUES (%s) "
+                "ON CONFLICT (channel_username) DO NOTHING",
                 (ch,),
             )
     logger.info("✅ DB ready")

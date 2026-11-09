@@ -190,9 +190,17 @@ async def ask_join(msg):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 کانال ۱", url="https://t.me/BET_1XZX")],
         [InlineKeyboardButton("📢 کانال ۲", url="https://t.me/GAP_BAZIN1")],
+        [InlineKeyboardButton("📢 کانال ۳", url="https://t.me/Starzivo")],
         [InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_membership")],
     ])
-    await msg.reply_text("⚠️ برای استفاده، در این کانال‌ها عضو شوید:\n\n1️⃣ @BET_1XZX\n2️⃣ @GAP_BAZIN1\n\nسپس «بررسی عضویت» را بزنید.", reply_markup=kb)
+    await msg.reply_text(
+        "⚠️ برای استفاده، در این کانال‌ها عضو شوید:\n\n"
+        "1️⃣ @BET_1XZX\n"
+        "2️⃣ @GAP_BAZIN1\n"
+        "3️⃣ @Starzivo\n\n"
+        "سپس «بررسی عضویت» را بزنید.",
+        reply_markup=kb
+    )
 
 # ---------- debug ----------
 async def debug_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
